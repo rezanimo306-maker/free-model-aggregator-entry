@@ -27,28 +27,37 @@ and failing over when a provider refuses.
 ## Tuning knobs (environment, all optional)
 
 - `AGG_SPREAD_MILLI` — rating points subtracted per prior call to a provider (0: pure rating order;
-  tuned default 20)
+  tuned default 200 in risk mode)
 - `AGG_SPREAD_MODE` — 0: the spread is charged per prior call; 1: per unit of the estimated
   chance the provider's next call refuses (budget priors from the kit's generator ranges,
-  updated by the failures seen so far)
+  updated by the failures seen so far; tuned default 1)
 - `AGG_SPREAD_W` — 1: the spread is divided by the request's weight (weight-2 requests hold
   the best model more tightly than weight-1 ones; tuned default 1)
-- `AGG_CAP` — soft cap on calls per provider; over-cap providers are tried last (0: no cap)
+- `AGG_FIRST_BONUS` — rating points added to a provider's first call in a trial (tuned default 50).
+  A first call always answers (the failure schedules start at the second call), so the bonus
+  steers the router toward unused providers and away from the risky second call — trading a few
+  rating points for a saved failover call.
 
 ## Tuning (local, 10 instances)
 
-The shipped defaults (`AGG_SPREAD_MILLI=20`, `AGG_SPREAD_W=1`) were chosen by sweeping
-routing variants against the 3 shipped practice trials plus 7 extra instances drawn from the
-kit's own generator with beacon-derived seeds (see `../extra-trials/`). Score 99 is the
-practical ceiling: quality 100 needs zero rating loss, but the best model (OpenRouter
-`z-ai/glm-5.3-flash:free`, 1475) has a budget of 10–12 calls and 17 requests want it, so some
-requests must fall back to 1470 or lower. Among the variants that scored 99 on all 10
-instances, the defaults had the fewest provider calls (mean 27.4, max 33) and the largest
-quality margin (worst weighted loss 556 of a 765 budget before quality drops to 97). Variants
-that pushed calls lower (a hard cap of 2 per provider, spread 30–40, retry-same) dropped
-individual trials to 94–98, and the risk-aware spread scored the same 99 but used more calls.
-Quality is the binding constraint: a single trial at 98 still scores 99, but a trial at 97
-scores 98, so the defaults keep a ~200-point loss margin rather than chasing the last call.
+The shipped defaults (`AGG_SPREAD_MODE=1`, `AGG_SPREAD_MILLI=200`, `AGG_FIRST_BONUS=50`,
+`AGG_SPREAD_W=1`) were chosen by sweeping routing variants against the 3 shipped practice trials
+plus 7 extra instances drawn from the kit's own generator with beacon-derived seeds (see
+`../extra-trials/`). Score 99 is the practical ceiling: quality 100 needs zero rating loss, but
+the best model (OpenRouter `z-ai/glm-5.3-flash:free`, 1475) has a budget of 10–12 calls and 17
+requests want it, so some requests must fall back to 1470 or lower. Round 2 changed the routing
+from a flat per-call spread to a risk-aware one: the old flat spread (mode 0, 20 points a call)
+spread load evenly but walked into the providers' scheduled second-call failures — on trial-0
+three providers' second calls (OpenRouter, Cloudflare, Z.ai) all failed on one request, costing
+4 calls. The risk-aware spread charges per unit of the estimated chance the next call refuses,
+scaled up so a risky second call is genuinely expensive, and the first-call bonus (a first call
+always answers) steers the router to unused providers first. Result on the 10 instances: mean
+23.2 provider calls (round 1: 27.4), max 29 (round 1: 33), trial-0 22 calls (round 1: 24) at
+quality 99 — inside the dev top-20 cutoff of 22 calls with quality intact. Quality is the binding
+constraint: a single trial at 98 still scores 99, but a trial at 97 scores 98, so the defaults
+keep quality 99 on 7 of 10 instances (round 1: also 7 of 10) rather than chasing the last call
+with a larger bonus or spread, both of which dropped quality to 98 on most instances.
+- `AGG_CAP` — soft cap on calls per provider; over-cap providers are tried last (0: no cap)
 - `AGG_RETRY_SAME` — 1: retry a refused provider once per request after its retry-after (0: never)
 - `AGG_MAX_TRIES` — most upstream attempts per request (default 20)
 
