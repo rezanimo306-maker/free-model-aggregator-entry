@@ -15,7 +15,7 @@
 //
 // Tuning knobs (environment, all optional; the defaults are the tuned values):
 //   AGG_SPREAD_MILLI  rating points subtracted per prior call to a provider (0: pure rating order;
-//                       tuned default 200 in risk mode: see the tuning notes in README.md)
+//                       tuned default 400 in risk mode: see the tuning notes in README.md)
 //   AGG_SPREAD_MODE   0: the spread is charged per prior call; 1: per unit of the estimated
 //                       chance the provider's next call refuses (budget priors from the kit's
 //                       generator ranges, updated by the failures seen so far; tuned default 1)
@@ -27,6 +27,12 @@
 //                       call always answers (the failure schedules start at the second call), so a
 //                       bonus steers the router toward unused providers and away from the risky
 //                       second call — trading a few rating points for a saved failover call.
+//   AGG_SCARCITY      rating points charged for spending a provider's first call on a request
+//                       when that provider is one of few that can serve a LATER request (0: off).
+//                       A first call spent on an abundant request forces a later scarce request
+//                       onto a risky second call; the charge is the sum over the requests still
+//                       to come of (that request's weight / how many providers can serve it).
+//                       Tuned default 60: see the tuning notes in README.md.
 //   AGG_MAX_TRIES     most upstream attempts per request (default 20)
 //
 // The trial's rules are in the kit's RULES.txt. Everything here is deterministic: no wall clock
@@ -87,7 +93,7 @@ const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
 
 /** Rating points subtracted per prior call to a provider (spreads load; 0 is pure rating order). */
-const SPREAD_MILLI = Number(process.env.AGG_SPREAD_MILLI ?? '200') || 0;
+const SPREAD_MILLI = Number(process.env.AGG_SPREAD_MILLI ?? '400') || 0;
 /** How the spread is charged: 0 per prior call, 1 per unit of estimated failure risk of the next call. */
 const SPREAD_MODE = Number(process.env.AGG_SPREAD_MODE ?? '1') || 0;
 /** 1: the spread is divided by the request's weight (a weight-2 request reuses the best more freely). */
@@ -98,8 +104,15 @@ const CAP = Number(process.env.AGG_CAP ?? '0') || 0;
 const RETRY_SAME = (process.env.AGG_RETRY_SAME ?? '0') === '1';
 /** Rating points added to a provider's first call in a trial (a first call always answers). */
 const FIRST_BONUS = Number(process.env.AGG_FIRST_BONUS ?? '50') || 0;
+/** Rating points charged for spending a scarce provider's first call on an abundant request (0: off). */
+const SCARCITY = Number(process.env.AGG_SCARCITY ?? '60') || 0;
 /** Most upstream attempts per request. */
 const MAX_TRIES = Number(process.env.AGG_MAX_TRIES ?? '20') || 20;
+
+/** For each manifest request, the providers holding a free model that meets it (by index). */
+let requestProviders: Array<Set<string>> = [];
+/** The weight of each manifest request, by index (1 outside the manifest). */
+let requestWeights: number[] = [];
 
 const brief = readBrief(PROMPT_FILE);
 let probes: Probe[] = [];
@@ -156,6 +169,12 @@ function failRisk(providerId: string): number {
   const calls = callsUsed.get(providerId) ?? 0;
   const fails = failures.get(providerId) ?? 0;
   const next = calls + 1;
+  // A provider's first call in a trial always answers (its failure schedule starts at
+  // the second call, its outage at the second call or later, and its budget covers it),
+  // so the next call carries no risk at all. The old code charged a first call the
+  // scheduled-failure density of its later calls, which made a risky second call of a
+  // top-rated model look better than a guaranteed first call of a slightly weaker one.
+  if (next === 1) return 0;
   const budget = midBudget(providerId);
   // Scheduled failures left, spread over the calls still ahead of this one.
   const scheduled = fails >= 2 ? 0 : Math.max(0, 1.5 - fails) / Math.max(1, budget - next);
@@ -176,6 +195,22 @@ async function load(): Promise<void> {
   probes = await Promise.all(brief.directory.providers.map((provider) => probeProvider(ENV_URL, provider, PROBE_TIMEOUT_MS)));
   for (const probe of probes) if (!probe.ok && probe.error !== null) log(probe.error);
   catalog = buildCatalog(ENV_URL, probes, brief.ratings);
+  buildRequestProviders();
+}
+
+/**
+ * For each manifest request, the providers holding a free model that meets it: the scarcity
+ * map the router charges against. Deterministic: it reads only the manifest, the probes and
+ * the quality table, all fixed before the first request arrives.
+ */
+function buildRequestProviders(): void {
+  const manifest = brief.workload?.manifest ?? [];
+  requestProviders = manifest.map((entry) => {
+    const set = new Set<string>();
+    for (const cand of rankedCandidates(probes, brief.ratings, entry.requires)) set.add(cand.probe.provider.id);
+    return set;
+  });
+  requestWeights = manifest.map((entry) => (typeof entry.weight === 'number' ? entry.weight : 1));
 }
 
 const byId = (a: ProbedModel, b: ProbedModel): number => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
@@ -198,6 +233,27 @@ function servedModels(): ServedModel[] {
 }
 
 /**
+ * The scarcity charge for spending a provider's first call on the request now arriving: the
+ * provider is one of few that can serve a request still to come, so using its first call here
+ * forces that later request onto a risky second call (or a weaker model). Charged only on
+ * first calls — a provider already used has spent its first call, so later calls on it cost
+ * no scarcity. The charge sums, over the requests still to come, each request's weight
+ * divided by how many providers can serve it: a request only two providers can serve weighs
+ * far more than one any of the ten can. Deterministic: it reads only the manifest, the
+ * probes and the ratings, and manifestIndex (the next request's index) only moves forward.
+ */
+function scarcityCharge(providerId: string): number {
+  if (SCARCITY === 0 || requestProviders.length === 0) return 0;
+  let charge = 0;
+  for (let j = manifestIndex; j < requestProviders.length; j++) {
+    const set = requestProviders[j];
+    if (set.size === 0 || !set.has(providerId)) continue;
+    charge += (requestWeights[j] ?? 1) / set.size;
+  }
+  return SCARCITY * charge;
+}
+
+/**
  * The effective rating of a candidate for one request: the quality table's rating less the
  * spread for its provider's load. Flat mode charges per prior call; risk mode charges per unit
  * of the estimated chance the provider's next call refuses, so a provider whose calls are
@@ -212,7 +268,9 @@ function effectiveRating(cand: Candidate, weight: number): number {
   // A first call cannot fail, so it earns a bonus: the router prefers an unused provider over
   // a risky second call unless the second call's model is better by more than the bonus.
   const bonus = used === 0 ? FIRST_BONUS : 0;
-  const net = charge - bonus;
+  // A first call spent here cannot serve a later request that few providers can meet.
+  const scarcity = used === 0 ? scarcityCharge(id) : 0;
+  const net = charge - bonus + scarcity;
   return cand.rating_milli - (SPREAD_W ? net / Math.max(1, weight) : net);
 }
 
