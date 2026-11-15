@@ -15,14 +15,18 @@
 //
 // Tuning knobs (environment, all optional; the defaults are the tuned values):
 //   AGG_SPREAD_MILLI  rating points subtracted per prior call to a provider (0: pure rating order;
-//                       tuned default 20: see the tuning notes in README.md)
+//                       tuned default 200 in risk mode: see the tuning notes in README.md)
 //   AGG_SPREAD_MODE   0: the spread is charged per prior call; 1: per unit of the estimated
 //                       chance the provider's next call refuses (budget priors from the kit's
-//                       generator ranges, updated by the failures seen so far)
+//                       generator ranges, updated by the failures seen so far; tuned default 1)
 //   AGG_SPREAD_W      1: the spread is divided by the request's weight (weight-2 requests hold
 //                       the best model more tightly than weight-1 ones; tuned default 1)
 //   AGG_CAP           soft cap on calls per provider; over-cap providers are tried last (0: no cap)
 //   AGG_RETRY_SAME    1: retry a refused provider once per request after its retry-after (0: never)
+//   AGG_FIRST_BONUS   rating points added to a provider's first call in a trial (0: none). A first
+//                       call always answers (the failure schedules start at the second call), so a
+//                       bonus steers the router toward unused providers and away from the risky
+//                       second call — trading a few rating points for a saved failover call.
 //   AGG_MAX_TRIES     most upstream attempts per request (default 20)
 //
 // The trial's rules are in the kit's RULES.txt. Everything here is deterministic: no wall clock
@@ -83,15 +87,17 @@ const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
 
 /** Rating points subtracted per prior call to a provider (spreads load; 0 is pure rating order). */
-const SPREAD_MILLI = Number(process.env.AGG_SPREAD_MILLI ?? '20') || 0;
+const SPREAD_MILLI = Number(process.env.AGG_SPREAD_MILLI ?? '200') || 0;
 /** How the spread is charged: 0 per prior call, 1 per unit of estimated failure risk of the next call. */
-const SPREAD_MODE = Number(process.env.AGG_SPREAD_MODE ?? '0') || 0;
+const SPREAD_MODE = Number(process.env.AGG_SPREAD_MODE ?? '1') || 0;
 /** 1: the spread is divided by the request's weight (a weight-2 request reuses the best more freely). */
 const SPREAD_W = (process.env.AGG_SPREAD_W ?? '1') === '1';
 /** Soft cap on calls per provider; over-cap providers are tried only when nothing else is left. */
 const CAP = Number(process.env.AGG_CAP ?? '0') || 0;
 /** Retry a refused provider once per request after its retry-after (1) or never (0). */
 const RETRY_SAME = (process.env.AGG_RETRY_SAME ?? '0') === '1';
+/** Rating points added to a provider's first call in a trial (a first call always answers). */
+const FIRST_BONUS = Number(process.env.AGG_FIRST_BONUS ?? '50') || 0;
 /** Most upstream attempts per request. */
 const MAX_TRIES = Number(process.env.AGG_MAX_TRIES ?? '20') || 20;
 
@@ -201,8 +207,13 @@ function servedModels(): ServedModel[] {
  */
 function effectiveRating(cand: Candidate, weight: number): number {
   const id = cand.probe.provider.id;
-  const charge = SPREAD_MODE === 1 ? SPREAD_MILLI * failRisk(id) : SPREAD_MILLI * (callsUsed.get(id) ?? 0);
-  return cand.rating_milli - (SPREAD_W ? charge / Math.max(1, weight) : charge);
+  const used = callsUsed.get(id) ?? 0;
+  const charge = SPREAD_MODE === 1 ? SPREAD_MILLI * failRisk(id) : SPREAD_MILLI * used;
+  // A first call cannot fail, so it earns a bonus: the router prefers an unused provider over
+  // a risky second call unless the second call's model is better by more than the bonus.
+  const bonus = used === 0 ? FIRST_BONUS : 0;
+  const net = charge - bonus;
+  return cand.rating_milli - (SPREAD_W ? net / Math.max(1, weight) : net);
 }
 
 /**
